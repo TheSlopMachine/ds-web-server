@@ -120,7 +120,9 @@ impl SessionHandle {
 // ── DeepSeek Patch 状态机 ─────────────────────────────────────────────
 
 const FRAG_THINK: &str = "THINK";
-const FRAG_RESPONSE: &str = "RESPONSE";
+
+/// 官方前端视为「回答正文」的片段类型（`RESPONSE_TYPES` in `main.*.js`）
+const RESPONSE_FRAGMENT_TYPES: [&str; 2] = ["RESPONSE", "TEMPLATE_RESPONSE"];
 
 /// Fragment 状态
 ///
@@ -128,6 +130,16 @@ const FRAG_RESPONSE: &str = "RESPONSE";
 /// 不再逐条 `push_str` 累积 —— 长响应下可省下与响应等长的内存与拷贝。
 struct Fragment {
     ty: String,
+}
+
+impl Fragment {
+    fn is_think(&self) -> bool {
+        self.ty == FRAG_THINK
+    }
+
+    fn is_response(&self) -> bool {
+        RESPONSE_FRAGMENT_TYPES.contains(&self.ty.as_str())
+    }
 }
 
 /// 维护 DeepSeek 响应的 patch 状态，对齐前端 DeltaParser
@@ -285,34 +297,59 @@ impl PatchState {
 
         if let Some(arr) = response.get_mut("fragments").and_then(|f| f.as_array_mut()) {
             self.fragments.clear();
-            for frag in arr {
-                let Some(obj) = frag.as_object_mut() else {
-                    continue;
-                };
-                let Some(ty) = obj.remove("type").and_then(take_string_owned) else {
-                    continue;
-                };
-                let content = obj
-                    .get_mut("content")
-                    .and_then(take_string)
-                    .unwrap_or_default();
-                let is_think = ty == FRAG_THINK;
-                let is_response = ty == FRAG_RESPONSE;
-                if is_response && !content.is_empty() {
-                    self.response_has_content = true;
-                }
-                if !content.is_empty() {
-                    if is_think {
-                        events.push(StreamEvent::ThinkDelta { content });
-                    } else if is_response {
-                        events.push(StreamEvent::ContentDelta { content });
-                    }
-                }
-                self.fragments.push(Fragment { ty });
-            }
+            events.extend(self.merge_fragments(arr, 0));
         }
 
         events
+    }
+
+    /// 合并上游下发的片段列表，产出新片段的初始内容
+    ///
+    /// `known` 之前的条目上游已经流式下发过（`SET` 整表替换时会重发），只更新类型；
+    /// 其余条目是新片段：记录类型，并把其初始 `content` 作为增量事件产出。
+    fn merge_fragments(
+        &mut self,
+        items: &mut [serde_json::Value],
+        known: usize,
+    ) -> Vec<StreamEvent> {
+        let mut events = Vec::new();
+        for (index, item) in items.iter_mut().enumerate() {
+            let Some(obj) = item.as_object_mut() else {
+                continue;
+            };
+            let Some(ty) = obj.remove("type").and_then(take_string_owned) else {
+                continue;
+            };
+            let fragment = Fragment { ty };
+            if let Some(existing) = self.fragments.get_mut(index).filter(|_| index < known) {
+                *existing = fragment;
+                continue;
+            }
+            let content = obj
+                .get_mut("content")
+                .and_then(take_string)
+                .unwrap_or_default();
+            if let Some(event) = self.fragment_event(&fragment, content) {
+                events.push(event);
+            }
+            self.fragments.push(fragment);
+        }
+        events
+    }
+
+    /// 片段增量 → 事件（THINK → 思考，RESPONSE 类 → 正文，其它类型忽略）
+    fn fragment_event(&mut self, fragment: &Fragment, content: String) -> Option<StreamEvent> {
+        if content.is_empty() {
+            return None;
+        }
+        if fragment.is_think() {
+            return Some(StreamEvent::ThinkDelta { content });
+        }
+        if fragment.is_response() {
+            self.response_has_content = true;
+            return Some(StreamEvent::ContentDelta { content });
+        }
+        None
     }
 
     fn apply_path(
@@ -338,51 +375,53 @@ impl PatchState {
                 }
             }
             "response/fragments/-1/content" | "/response/fragments/-1/content" => {
-                if let Some(s) = take_string(val)
-                    && let Some(frag) = self.fragments.last()
+                if let Some(content) = take_string(val)
+                    && let Some(frag) = self.fragments.pop()
                 {
-                    match frag.ty.as_str() {
-                        FRAG_THINK => events.push(StreamEvent::ThinkDelta { content: s }),
-                        FRAG_RESPONSE => {
-                            self.response_has_content = true;
-                            events.push(StreamEvent::ContentDelta { content: s });
-                        }
-                        _ => {}
-                    }
+                    events.extend(self.fragment_event(&frag, content));
+                    self.fragments.push(frag);
                 }
             }
-            "response/fragments" | "/response/fragments" if op == "APPEND" => {
-                if let Some(arr) = val.as_array_mut() {
-                    for item in arr {
-                        let Some(obj) = item.as_object_mut() else {
-                            continue;
-                        };
-                        let Some(ty) = obj.remove("type").and_then(take_string_owned) else {
-                            continue;
-                        };
-                        let content = obj
-                            .get_mut("content")
-                            .and_then(take_string)
-                            .unwrap_or_default();
-                        let is_think = ty == FRAG_THINK;
-                        let is_response = ty == FRAG_RESPONSE;
-                        if !content.is_empty() {
-                            if is_think {
-                                events.push(StreamEvent::ThinkDelta { content });
-                            } else if is_response {
-                                self.response_has_content = true;
-                                events.push(StreamEvent::ContentDelta { content });
-                            }
-                        }
-                        self.fragments.push(Fragment { ty });
-                    }
+            // 新片段开始：旧协议 `APPEND` 只发新片段（数组或单个对象），
+            // 2026-11 起上游改为 `SET` 整表替换（已知片段 + 新片段，见 upstream issue #125）
+            "response/fragments" | "/response/fragments" => match (op, val) {
+                ("APPEND", serde_json::Value::Array(items)) => {
+                    events.extend(self.merge_fragments(items, 0));
                 }
-            }
-            _ => {}
+                ("APPEND", item @ serde_json::Value::Object(_)) => {
+                    events.extend(self.merge_fragments(std::slice::from_mut(item), 0));
+                }
+                ("SET", serde_json::Value::Array(items)) => {
+                    self.fragments.truncate(items.len());
+                    let known = self.fragments.len();
+                    events.extend(self.merge_fragments(items, known));
+                }
+                (op, val) => log_unhandled_patch(path, op, val),
+            },
+            _ => log_unhandled_patch(path, op, val),
         }
 
         events
     }
+}
+
+/// 记录状态机未处理的 patch：上游协议再变时能从 debug 日志直接看到，而不是静默丢内容
+fn log_unhandled_patch(path: &str, op: &str, val: &serde_json::Value) {
+    if !log::log_enabled!(target: "ds_core::accounts", log::Level::Debug) {
+        return;
+    }
+    let kind = match val {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "bool",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    };
+    log::debug!(
+        target: "ds_core::accounts",
+        "unhandled patch: path={path:?}, op={op}, value={kind}"
+    );
 }
 
 /// 取出 JSON 字符串的所有权（内容不复制）
@@ -821,6 +860,63 @@ pub(crate) async fn wait_close(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 依次喂入 SSE 帧，返回 (思考增量, 正文增量)
+    fn deltas(frames: &[&str]) -> (Vec<String>, Vec<String>) {
+        let mut state = PatchState::new();
+        let (mut think, mut content) = (Vec::new(), Vec::new());
+        for frame in frames {
+            for event in state.apply_frame(frame).expect("frame must parse") {
+                match event {
+                    StreamEvent::ThinkDelta { content: c } => think.push(c),
+                    StreamEvent::ContentDelta { content: c } => content.push(c),
+                    _ => {}
+                }
+            }
+        }
+        (think, content)
+    }
+
+    /// 回归（upstream issue #125）：上游用 `SET` 整表替换片段列表开始回答时，
+    /// 新的 RESPONSE 片段及其首个分片必须进入正文，后续增量也不能拼到 THINK 里
+    #[test]
+    fn fragments_set_starts_response_after_think() {
+        let (think, content) = deltas(&[
+            r#"data: {"v":{"response":{"message_id":2,"status":"WIP","fragments":[{"id":1,"type":"THINK","content":"Hmm"}]}}}"#,
+            r#"data: {"p":"response/fragments/-1/content","o":"APPEND","v":" think"}"#,
+            r#"data: {"v":" more"}"#,
+            r#"data: {"p":"response/fragments/-1/elapsed_secs","o":"SET","v":1.5}"#,
+            r#"data: {"p":"response/fragments","o":"SET","v":[{"id":1,"type":"THINK","content":"Hmm think more"},{"id":2,"type":"RESPONSE","content":"Capital"}]}"#,
+            r#"data: {"p":"response/fragments/-1/content","o":"APPEND","v":"a is Paris."}"#,
+            r#"data: {"p":"response/status","o":"SET","v":"FINISHED"}"#,
+        ]);
+        assert_eq!(think, ["Hmm", " think", " more"]);
+        assert_eq!(content, ["Capital", "a is Paris."]);
+    }
+
+    /// 旧协议：`APPEND` 只带新片段（数组或单个对象）仍然可用
+    #[test]
+    fn fragments_append_array_and_single_object() {
+        let (think, content) = deltas(&[
+            r#"data: {"v":{"response":{"status":"WIP","fragments":[]}}}"#,
+            r#"data: {"p":"response/fragments","o":"APPEND","v":[{"type":"THINK","content":"a"}]}"#,
+            r#"data: {"p":"response/fragments","o":"APPEND","v":{"type":"RESPONSE","content":"b"}}"#,
+            r#"data: {"p":"response/fragments/-1/content","o":"APPEND","v":"c"}"#,
+        ]);
+        assert_eq!(think, ["a"]);
+        assert_eq!(content, ["b", "c"]);
+    }
+
+    /// 官方前端把 TEMPLATE_RESPONSE 当正文渲染；未知类型的片段不产出事件
+    #[test]
+    fn template_response_is_content_and_unknown_types_are_dropped() {
+        let (think, content) = deltas(&[
+            r#"data: {"v":{"response":{"fragments":[{"type":"SEARCH","content":"x"},{"type":"TEMPLATE_RESPONSE","content":"t"}]}}}"#,
+            r#"data: {"p":"response/fragments/-1/content","o":"APPEND","v":"u"}"#,
+        ]);
+        assert!(think.is_empty());
+        assert_eq!(content, ["t", "u"]);
+    }
 
     /// 回归：上游在 status=FINISHED 之后直接断流时，`accumulated_token_usage` 与
     /// `finish_reason` 仍必须出现在 Done 事件里（issue #93：completion_tokens 恒为 0）

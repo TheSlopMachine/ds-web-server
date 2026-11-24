@@ -168,6 +168,9 @@ fn openai_error_response(err: &ServerError) -> Response {
                 OpenAIAdapterError::Internal(_) | OpenAIAdapterError::ToolCallRepairNeeded(_) => {
                     ("server_error", "internal_error")
                 }
+                OpenAIAdapterError::Account { reason, .. } => {
+                    (account_error_type(status), reason.code())
+                }
             };
             (status, error_type, code)
         }
@@ -210,10 +213,29 @@ fn openai_error_response(err: &ServerError) -> Response {
 
     log::debug!(target: "http::response", "{} error: {}", status, body.error.message);
 
-    let mut resp = (status, Json(body)).into_response();
-    if status == StatusCode::TOO_MANY_REQUESTS {
-        resp.headers_mut()
-            .insert(header::RETRY_AFTER, HeaderValue::from_static("30"));
+    let retry_after = match err {
+        ServerError::Adapter(e) => e.retry_after_secs(),
+        _ => None,
+    };
+    with_retry_after((status, Json(body)).into_response(), retry_after)
+}
+
+/// 指定账号不可用时 OpenAI 信封的 `type`（按状态码归类）
+const fn account_error_type(status: StatusCode) -> &'static str {
+    match status.as_u16() {
+        404 => "invalid_request_error",
+        429 => "rate_limit_error",
+        403 => "permission_error",
+        _ => "server_error",
+    }
+}
+
+/// 有建议的重试间隔时带上 `Retry-After`
+fn with_retry_after(mut resp: Response, secs: Option<u64>) -> Response {
+    if let Some(secs) = secs
+        && let Ok(value) = HeaderValue::from_str(&secs.to_string())
+    {
+        resp.headers_mut().insert(header::RETRY_AFTER, value);
     }
     resp
 }
@@ -226,6 +248,12 @@ fn anthropic_error_response(err: &AnthropicCompatError) -> Response {
         AnthropicCompatError::BadRequest(_) => "invalid_request_error",
         AnthropicCompatError::Overloaded => "overloaded_error",
         AnthropicCompatError::Internal(_) => "api_error",
+        AnthropicCompatError::Account { .. } => match status.as_u16() {
+            404 => "not_found_error",
+            429 => "rate_limit_error",
+            403 => "permission_error",
+            _ => "overloaded_error",
+        },
     };
 
     let body = AnthropicErrorBody {
@@ -241,12 +269,7 @@ fn anthropic_error_response(err: &AnthropicCompatError) -> Response {
         "{} Anthropic error: {}", status, body.error.message
     );
 
-    let mut resp = (status, Json(body)).into_response();
-    if status == StatusCode::TOO_MANY_REQUESTS {
-        resp.headers_mut()
-            .insert(header::RETRY_AFTER, HeaderValue::from_static("30"));
-    }
-    resp
+    with_retry_after((status, Json(body)).into_response(), err.retry_after_secs())
 }
 
 /// Anthropic 形态的鉴权/未找到错误（供 `/anthropic/*` 路由使用）

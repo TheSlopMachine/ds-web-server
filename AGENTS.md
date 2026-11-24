@@ -292,22 +292,44 @@ the real client only logs in / rotates the device token / lists sessions at star
 sends a message. Account validity is still covered by a successful login plus the mute
 early-check (`biz_code` 5). Set the flag back to `true` for the historical probe.
 
-There is **no retry inside `init()`** and **no `InitFailed` state** — a failure immediately
-marks the account `Invalid`. The states are `Idle` / `Busy` / `Error` / `Invalid`.
+Startup, `PUT /admin/api/config` and the account API all go through one entry point,
+`AccountPool::sync(desired, remove_missing)`: new accounts and accounts whose credentials
+changed log in (replacing the old entry), unchanged accounts are left alone (no re-login, so
+periodic syncs are cheap), and `remove_missing` drops the rest. Failed accounts stay in the pool.
+The states are `Idle` / `Busy` / `Error` / `Invalid`.
 
-Retries live in the background recovery task (`start_recovery_task`, every 60s): accounts in
-`Error` are re-logged-in, and after `MAX_ERROR_COUNT` (3) consecutive failures they become `Invalid`.
-**Terminal** login errors (`biz_code` 2 / 5 / 10 / 11 — wrong credentials, muted, banned,
-device rejected) mark the account `Invalid` immediately via `is_terminal_login_error`:
-retrying them only keeps hitting upstream, and the docs note that retrying a muted account
-can extend the mute.
+Every login result goes through `Account::record_login`, which stores an `AccountFailure`
+(`kind` / `message` / `biz_code` / `mute_until` / `at`) exposed in `AccountStatus.failure`.
+`FailureKind::is_terminal` decides the state: terminal failures (`biz_code` 2 / 5 / 10 / 11 —
+wrong credentials, muted, banned, device rejected — plus WAF block, health check, bad config)
+go straight to `Invalid`, because retrying them only keeps hitting upstream and retrying a
+muted account can extend the mute. Transient failures go to `Error`.
+
+The background recovery task (`start_recovery_task`, every 60s) re-logs-in `Error` accounts
+(after `MAX_ERROR_COUNT` (3) consecutive failures they become `Invalid`), retries `Invalid`
+accounts whose mute has expired (`mute_until` passed) once, and reaps idle reuse sessions.
+It iterates a snapshot of `Arc<Account>` (`AccountPool::snapshot`): never hold a DashMap
+guard across `.await`, or concurrent account inserts/removals block a worker thread.
 
 `update_title` exists in the raw client (`ds_core/src/accounts/client.rs`) but has **no call
 site** — do not describe it as part of the init flow.
 
+### Pinned Accounts (`X-DS-Account`)
+
+`ChatRequest.account` (filled from the `X-DS-Account` request header by the three POST
+handlers) pins a request to one account, so a caller that manages accounts itself (for example
+a router that maps its own credentials 1:1 to pool accounts) gets errors attributed to the
+right account. A pinned request never switches accounts: `AccountPool::acquire` waits up to
+30s while the account is busy, otherwise returns `AccountUnavailable` (`NotFound` / `Busy` /
+`Recovering` / `QuotaExhausted` / `Failed(AccountFailure)`), surfaced as
+`CoreError::Account` → `OpenAIAdapterError::Account` → an error with `code` from
+`AccountUnavailable::code()`, status from `account_unavailable_status()` and `Retry-After`
+from `AccountUnavailable::retry_after_secs()`. Tool-call repair requests run while the pinned
+account is still busy, so they are never pinned.
+
 ### Request Flow (per-chat)
 
-`v0_chat()` → `get_account()` → `split_history()` → `create_session()` → `upload_files()` → `compute_pow()` → `completion()` → `parse_ready()` → `GuardedStream`
+`v0_chat()` → `acquire_account()` → `split_history()` → `create_session()` → `upload_files()` → `compute_pow()` → `completion()` → `parse_ready()` → `GuardedStream`
 
 Each `v0_chat()` call creates a dedicated session, uploads multi-turn history as files, then streams the response. The response is a `StreamEvent` stream (not raw SSE bytes) — the new **精简响应协议** abstracts away DeepSeek's p/o/v patch protocol into typed events: `Meta`, `ThinkStart`, `ThinkDelta`, `ContentStart`, `ContentDelta`, `Done`. The session is destroyed when the stream ends via `GuardedStream::drop`, which also calls `stop_stream` on abnormal disconnects. Sessions are tracked in `active_sessions: Arc<Mutex<HashMap<String, ActiveSession>>>`.
 
@@ -483,10 +505,10 @@ Errors propagate upward with translation at each module boundary:
 
 1. **`ds_core/client.rs`**: `ClientError` (`Http` | `Status` | `Business` | `Json` | `InvalidHeader`)
    - Parses DeepSeek's wrapper envelope `{code, msg, data: {biz_code, biz_msg, biz_data}}` via `Envelope::into_result()`
-2. **`ds_core/pool.rs`**: `PoolError` (`AllAccountsFailed` | `Client`(ClientError) | `Pow`(PowError) | `Validation` | `Exists`)
-3. **`ds_core/lib.rs`**: `CoreError` (`Overloaded` | `ProofOfWorkFailed` | `ProviderError` | `Stream`)
-4. **`openai_adapter.rs`**: `OpenAIAdapterError` (`BadRequest` | `Overloaded` | `ProviderError` | `Internal` | `ToolCallRepairNeeded`)
-5. **`anthropic_compat.rs`**: `AnthropicCompatError` (`BadRequest` | `Overloaded` | `Internal`)
+2. **`ds_core/pool.rs`**: `PoolError` (`Client`(ClientError) | `Pow`(PowError) | `Validation` | `Muted` | `HealthCheck` | `NotFound` | `AccountBusy` | `NotReady`); login failures are classified into `AccountFailure` / `FailureKind`
+3. **`ds_core/lib.rs`**: `CoreError` (`Overloaded` | `ProofOfWorkFailed` | `ProviderError` | `Stream` | `Account`)
+4. **`openai_adapter.rs`**: `OpenAIAdapterError` (`BadRequest` | `Overloaded` | `ProviderError` | `Internal` | `ToolCallRepairNeeded` | `Account`)
+5. **`anthropic_compat.rs`**: `AnthropicCompatError` (`BadRequest` | `Overloaded` | `Internal` | `Account`)
 6. **`server/error.rs`**: `ServerError` (`Adapter`(OpenAIAdapterError) | `Anthropic`(AnthropicCompatError) | `Unauthorized` | `NotFound`(String))
 
 All errors use `thiserror` derive macro.
@@ -641,7 +663,7 @@ Follow `docs/code-style.md`:
 | Issue | Symptom | Likely Cause / Fix |
 |-------|---------|--------------------|
 | WASM load failure | `PowError::Execution` on startup | DeepSeek recompiled WASM. PowSolver now uses dynamic export probing (no hardcoded symbols). Update `wasm_url` in `config.toml` if WASM URL changed |
-| WAF blocking (non-US) | AWS WAF Challenge response (status 202) | Configure a non-US proxy in `config.toml` `[proxy]` |
+| WAF blocking (login) | AWS WAF Challenge (status 202) on `/users/login`, account `failure.kind = blocked` | Region-dependent: verified 2026-11-24 from an EU egress, only the login endpoint challenges the web identity (`chrome136` + Chrome UA); `identity_probe` shows the app identity (`okhttp4_12` + `DeepSeek/2.5.0 Android/35` + `client_platform`/`client_os = android`) passes. Switch to the app identity, or use a proxy in another region |
 | WAF blocking (fingerprint) | HTTP 403 / connection reset / 202 challenge | `wreq` uses BoringSSL; the fingerprint is chosen by `emulation` (`chrome136` default = desktop Chrome, matching the default web identity; `okhttp4_12` for the Android-app identity). Verify the identity is self-consistent (UA ↔ `client_platform` ↔ emulation) with `cargo run -p ds_core --example identity_probe` — it hits only unauthenticated endpoints, no account traffic |
 | Account init failure | All accounts stuck in init | Bad credentials (login fails first) or rate-limited (too many sessions). Check `[accounts]` in config |
 | Login fails with `RISK_DEVICE_DETECTED` (biz_code 11) | `客户端错误: Business error: code=11, msg=RISK_DEVICE_DETECTED` during account init | DeepSeek requires a browser-registered device fingerprint. Capture `device_id` from a real browser login (`POST /api/v0/users/login`) and set it per account in `config.toml` / the admin panel |
@@ -684,7 +706,7 @@ Follow `docs/code-style.md`:
 | HTTP server/routes | `src/server/` | handlers → stream → error; `request_id_middleware` mints `req-{n}` + `x-request-id` |
 | Idempotency cache | `src/server/idempotency.rs` | `Idempotency-Key` scope/conflict/replay rules + `RecordingStream` for SSE replay |
 | PoW WASM solver | `ds_core/src/accounts/pow.rs` | wasmtime loading, dynamic export probing, DeepSeekHashV1 |
-| DeepSeek HTTP client | `ds_core/src/accounts/client.rs` | `Envelope::into_result()`, WAF detection, all API methods. `ClientIdentity::headers(FetchSite)` also overrides wreq's navigation-style defaults with the captured XHR header set; `CompletionPayload` carries `source = "input"` like the official client |
+| DeepSeek HTTP client | `ds_core/src/accounts/client.rs` | `Envelope::into_result()`, WAF detection, all API methods. `ClientIdentity::headers(FetchSite)` also overrides wreq's navigation-style defaults with the captured XHR header set; `CompletionPayload` carries `source = "default"` like the official client (upstream accepts only `default` / `landing` since 2026-11) |
 | HIF risk-control tokens | `ds_core/src/accounts/hif.rs` | `x-hif-leim` **and** `x-hif-dliq`: two isomorphic no-auth endpoints, TTL from `x-hif-ttl`, per-device buckets, attached to SSE requests only (whichever is available). Missing them marks the request as a non-official client — see `docs/development.md` (2026-10-07) |
 | Unified debug CLI | `examples/adapter_cli.rs` | Modes: chat/raw/compare/concurrent/status/models |
 | Risk-token probe | `examples/hif_probe.rs` | Checks the `hif-leim` endpoint only — **no account traffic** (`hif-dliq` is NXDOMAIN in some networks; the browser also fails to fetch it there) |
@@ -714,7 +736,8 @@ Follow `docs/code-style.md`:
 | DeepSeek API reference | `ds_core/raw-api-reference.md` | 端点、信封格式、SSE 增量协议、PoW 算法 |
 | Development guide | `docs/development.md` | 环境配置、首次启动、Release 构建 |
 | Admin panel routes | `src/server/admin.rs` | Setup/login/config/status/stats/models/logs handlers |
-| JWT auth + password | `src/server/auth.rs` | `setup_admin()`/`login_admin()`, JWT sign/verify, login rate limiter |
+| Account management API | `src/server/admin.rs` | `GET`/`PUT /admin/api/accounts`, `PUT`/`DELETE /admin/api/accounts/{id}`, `POST /admin/api/accounts/{id}/login`; mutations hold `AppState.accounts_lock` (not the config lock, logins wait on the network), call `AccountPool::sync` / `remove_account` / `relogin`, then write `config.toml` |
+| JWT auth + password | `src/server/auth.rs` | `setup_admin()`/`login_admin()`, JWT sign/verify, login rate limiter. Each JWT login rotates `jwt_issued_at`, revoking older tokens; automation uses the static `[admin] api_token` instead (`StoreManager::is_admin_api_token`, constant-time compare) |
 | Store manager | `src/server/store.rs` | API key validation, stats persistence, delegates admin/keys to `Config::save()` |
 | Request stats | `src/server/stats.rs` | `RequestStats`, `StatsHandle`, background flush to `stats.json` |
 | Runtime log | `src/server/runtime_log.rs` | stdout redirect to `runtime.log` with rotation |

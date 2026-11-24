@@ -120,7 +120,7 @@ async fn handle_line(line: &str, adapter: &OpenAIAdapter) -> anyhow::Result<bool
             let rid = demo_req_id();
             println!(">>> chat: {file} [req={rid}]");
             let req = serde_json::from_slice::<ChatCompletionsRequest>(&body)?;
-            let result = adapter.chat_completions(req, &rid).await?;
+            let result = adapter.chat_completions(req, &rid, None).await?;
             println!("[account: {}]", result.account_id);
             match result.data {
                 ChatOutput::Stream(mut s) => {
@@ -169,7 +169,7 @@ async fn handle_line(line: &str, adapter: &OpenAIAdapter) -> anyhow::Result<bool
             let rid2 = demo_req_id();
             println!("\n═══ CONVERTED OPENAI SSE [req={rid2}] ═════════════════════════════");
             let conv_req = serde_json::from_slice::<ChatCompletionsRequest>(&body)?;
-            let converted_result = adapter.chat_completions(conv_req, &rid2).await?;
+            let converted_result = adapter.chat_completions(conv_req, &rid2, None).await?;
             println!("[account: {}]", converted_result.account_id);
             match converted_result.data {
                 ChatOutput::Stream(mut s) => {
@@ -375,7 +375,7 @@ async fn run_concurrent(adapter: &OpenAIAdapter, count: usize, body: Vec<u8>, ra
                     }
                 };
 
-                let result = match adapter.chat_completions(req, &rid).await {
+                let result = match adapter.chat_completions(req, &rid, None).await {
                     Ok(r) => r,
                     Err(e) => {
                         eprintln!("[请求{i} 失败] {e}");

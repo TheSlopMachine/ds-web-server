@@ -6,6 +6,55 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### 修复：开启思考时回答为空（upstream issue #125）
+
+- 2026-11 起上游在回答开始时用 `o: "SET"` 整表替换 `response/fragments`（旧协议是
+  `APPEND` 只发新片段）。旧解析器只认 `APPEND`：RESPONSE 片段和回答的首个分片被丢掉，
+  后续正文拼进了思考内容，`content` 为空（日志 `状态机 FINISHED 但无 RESPONSE 内容`）。
+  现在 `SET` 整表时已知片段只更新类型，新片段记录并产出初始内容
+- 与官方前端一致，`TEMPLATE_RESPONSE` 片段按正文处理；`APPEND` 也接受单个片段对象
+- 状态机未处理的 patch 以 debug 级别记录（`ds_core::accounts`），协议再变时不再静默丢内容
+
+### 修复：completion 请求被上游 422 拒绝
+
+- 2026-11-24 实测上游的 `source` 只接受 `default` / `landing`，发 `input` 返回 422
+  `unknown variant`（每个请求都失败，账号还会被标成 Error）。现在统一发 `default`
+
+### 修复：WAF 提示误导
+
+- 实测（2026-11-24，EU 出口）只有登录接口会对 Web 身份（`chrome136` + Chrome UA）发 WAF
+  质询，App 身份（`okhttp4_12` + Android UA + `android`）能通过。WAF 提示与错误信息改为
+  给出这两种解决办法，不再只说「换非美国代理」
+
+### 新增：按账号管理与路由（便于上层系统托管账号）
+
+- **`X-DS-Account` 请求头**（`/v1/chat/completions`、`/v1/responses`、
+  `/anthropic/v1/messages`）：指定由哪个账号（email 或 mobile）处理请求。不换号，
+  账号不可用时返回带专用 `code` 的错误：`account_not_found`（404）、
+  `account_busy` / `account_quota_exhausted` / `account_muted`（429，带 `Retry-After`）、
+  `account_recovering` / `account_blocked` / `account_unavailable`（503）、
+  `account_invalid_credentials` / `account_banned` / `account_device_rejected` 等（403）
+- **账号管理 API**：`GET /admin/api/accounts`、`PUT /admin/api/accounts`（整体替换）、
+  `PUT` / `DELETE /admin/api/accounts/{id}`、`POST /admin/api/accounts/{id}/login`。
+  变更立即同步账号池并写回 `config.toml`，响应里直接带登录结果
+- **账号状态带失败原因**：`/admin/api/status` 与账号 API 的每个账号新增 `id` 和
+  `failure`（`kind` / `message` / `biz_code` / `mute_until` / `at`），不必再翻运行日志
+- **`[admin] api_token`**：管理 API 的静态 Bearer 令牌，自动化调用方无需设置密码、登录，
+  也不受面板登录轮换 JWT 影响
+- **代理读取环境变量**：未设置 `[proxy] url` 时依次读取 `HTTPS_PROXY` / `https_proxy` /
+  `ALL_PROXY` / `all_proxy`。代理地址无法解析时启动失败，不再静默直连
+
+### 账号池行为变更
+
+- 登录遇到临时错误（网络、PoW 等）时账号进入 Error，由恢复任务重试（连续 3 次失败才置
+  Invalid）；此前启动阶段的任何失败都直接置 Invalid
+- 被禁言的账号到 `mute_until` 后由恢复任务自动再登录一次
+- 同步账号（`PUT /admin/api/config` 与账号 API）时，同一账号的凭据变化会用新凭据重新登录；
+  此前只处理新增 / 删除的账号，改密码要先删再加
+- 登录失败的账号无论何时加入都留在池中（带失败原因）；此前运行时添加失败的账号不出现在状态里
+- 移除正在处理请求的账号不再被拒绝：请求正常跑完，复用会话在后台删除
+- 遍历账号做网络请求（恢复任务、回收会话）时不再持有 DashMap 分片锁，避免与增删账号互相阻塞
+
 ### ⚠️ 默认配置改为「对齐浏览器」（行为变更）
 
 > 原则：**我们并不知道上游依据哪些信号判定违规**，因此每一项都向真实客户端靠拢 ——

@@ -79,7 +79,7 @@ impl OpenAIAdapter {
             startup_health_check: config.ds_core.startup_health_check,
             session_policy: config.ds_core.session_policy.clone(),
             session_idle_secs: config.ds_core.session_idle_secs,
-            proxy_url: config.proxy.url.clone(),
+            proxy_url: config.proxy.effective_url(),
             model_types: config.ds_core.model_types.clone(),
             input_character_limits: config.ds_core.input_character_limits.clone(),
             hourly_request_quota: config.ds_core.hourly_request_quota,
@@ -88,13 +88,7 @@ impl OpenAIAdapter {
             .ds_core
             .accounts
             .iter()
-            .map(|a| AccountConfig {
-                email: a.email.clone(),
-                mobile: a.mobile.clone(),
-                area_code: a.area_code.clone(),
-                password: a.password.clone(),
-                device_id: a.device_id.clone(),
-            })
+            .map(crate::config::Account::to_core)
             .collect();
         let ds_core = Arc::new(DsCore::new(&core_cfg, accounts).await?);
         let model_registry = config.ds_core.model_registry();
@@ -123,10 +117,13 @@ impl OpenAIAdapter {
     /// 内部校验参数、构建 ChatML prompt、按 stream 标记分流：
     /// - stream=true  → 返回 SSE 字节流
     /// - stream=false → 将 SSE 流聚合为单个 JSON 对象后返回
+    ///
+    /// `account` 指定处理请求的账号（`X-DS-Account` 请求头），None = 号池挑选。
     pub async fn chat_completions(
         &self,
         mut req: ChatCompletionsRequest,
         request_id: &str,
+        account: Option<&str>,
     ) -> Result<ChatResult<ChatOutput>, OpenAIAdapterError> {
         log::debug!(target: "adapter", "req={} adapter start: model={}, stream={}", request_id, req.model, req.stream);
 
@@ -194,6 +191,7 @@ impl OpenAIAdapter {
             model_type: model_res.model_type,
             files: file_result.files,
             delta,
+            account: account.map(str::to_owned),
         };
 
         let chat_resp = self.try_chat(chat_req, request_id).await?;
@@ -344,6 +342,7 @@ impl OpenAIAdapter {
             model_type: model_res.model_type,
             files: vec![],
             delta: None,
+            account: None,
         };
         let chat_resp = self.try_chat(ds_req, request_id).await?;
         let (account_id, event_stream) = Self::take_meta(chat_resp.stream).await?;
@@ -384,92 +383,29 @@ impl OpenAIAdapter {
             .map_err(OpenAIAdapterError::from)
     }
 
-    /// 动态添加账号
-    pub async fn add_account(
+    /// 让账号池与配置中的账号列表一致，返回列表中各账号的状态
+    ///
+    /// 凭据未变的账号不会重新登录；`remove_missing` 时移除列表之外的账号。
+    pub(crate) async fn sync_accounts(
         &self,
-        creds: &crate::config::Account,
-    ) -> Result<String, ds_core::PoolError> {
-        let ac = AccountConfig {
-            email: creds.email.clone(),
-            mobile: creds.mobile.clone(),
-            area_code: creds.area_code.clone(),
-            password: creds.password.clone(),
-            device_id: creds.device_id.clone(),
-        };
-        self.ds_core.add_account(&ac).await
-    }
-
-    /// 动态移除账号
-    pub fn remove_account(&self, email_or_mobile: &str) -> Result<String, ds_core::PoolError> {
-        self.ds_core.remove_account(email_or_mobile)
-    }
-
-    /// 标记账号为 Error 状态
-    pub fn mark_error(&self, email_or_mobile: &str) {
-        self.ds_core.mark_error(email_or_mobile);
-    }
-
-    /// 手动重新登录指定账号
-    pub async fn re_login_single(&self, email_or_mobile: &str) -> Result<(), String> {
-        self.ds_core.re_login_single(email_or_mobile).await
-    }
-}
-
-impl OpenAIAdapter {
-    /// 批量同步账号：对比当前账号池与目标配置，增删差异账号
-    pub(crate) async fn sync_accounts(&self, new_accounts: &[crate::config::Account]) {
-        let old_statuses = self.account_statuses();
-        let old_ids: Vec<String> = old_statuses
+        accounts: &[crate::config::Account],
+        remove_missing: bool,
+    ) -> Result<Vec<ds_core::AccountStatus>, ds_core::PoolError> {
+        let desired = accounts
             .iter()
-            .map(|a| {
-                if a.email.is_empty() {
-                    a.mobile.clone()
-                } else {
-                    a.email.clone()
-                }
-            })
+            .map(crate::config::Account::to_core)
             .collect();
+        self.ds_core.sync_accounts(desired, remove_missing).await
+    }
 
-        let mut _added = 0usize;
-        let mut _failed = 0usize;
-        for acct in new_accounts {
-            let id = if acct.email.is_empty() {
-                &acct.mobile
-            } else {
-                &acct.email
-            };
-            if !old_ids.contains(id) {
-                match self.add_account(acct).await {
-                    Ok(_) => _added += 1,
-                    Err(e) => {
-                        log::warn!(target: "adapter", "failed to add account during sync {id}: {e}");
-                        _failed += 1;
-                    }
-                }
-            }
-        }
+    /// 移除账号
+    pub fn remove_account(&self, id: &str) -> Result<String, ds_core::PoolError> {
+        self.ds_core.remove_account(id)
+    }
 
-        let mut _removed = 0usize;
-        let new_ids: Vec<&str> = new_accounts
-            .iter()
-            .map(|a| {
-                if a.email.is_empty() {
-                    a.mobile.as_str()
-                } else {
-                    a.email.as_str()
-                }
-            })
-            .collect();
-        for old_id in &old_ids {
-            if !new_ids.contains(&old_id.as_str()) && !old_id.is_empty() {
-                match self.remove_account(old_id) {
-                    Ok(_) => _removed += 1,
-                    Err(e) => {
-                        log::warn!(target: "adapter", "failed to remove account during sync {old_id}: {e}");
-                    }
-                }
-            }
-        }
+    /// 重新登录指定账号
+    pub async fn relogin(&self, id: &str) -> Result<ds_core::AccountStatus, ds_core::PoolError> {
+        self.ds_core.relogin(id).await
     }
 
     /// 从流中提取首个 Meta 事件的 account_id，同时保留 Meta 在流中
@@ -509,8 +445,9 @@ impl OpenAIAdapter {
     }
 
     pub async fn reload_config(&self, new_config: &crate::config::Config) -> Result<(), CoreError> {
-        // Sync accounts
-        self.sync_accounts(&new_config.ds_core.accounts).await;
+        self.sync_accounts(&new_config.ds_core.accounts, true)
+            .await
+            .map_err(|e| CoreError::ProviderError(e.to_string()))?;
         // Rebuild model registry
         let registry = new_config.ds_core.model_registry();
         *self.model_registry.write().await = registry;
@@ -543,7 +480,7 @@ impl OpenAIAdapter {
             startup_health_check: new_config.ds_core.startup_health_check,
             session_policy: new_config.ds_core.session_policy.clone(),
             session_idle_secs: new_config.ds_core.session_idle_secs,
-            proxy_url: new_config.proxy.url.clone(),
+            proxy_url: new_config.proxy.effective_url(),
             model_types: new_config.ds_core.model_types.clone(),
             input_character_limits: new_config.ds_core.input_character_limits.clone(),
             hourly_request_quota: new_config.ds_core.hourly_request_quota,
@@ -593,6 +530,8 @@ impl OpenAIAdapter {
                     model_type: "default".to_string(),
                     files: vec![],
                     delta: None,
+                    // 修复请求发生在原请求的流期间：原账号仍忙，交给号池挑选
+                    account: None,
                 };
                 log::debug!(
                     target: "adapter",
@@ -630,6 +569,38 @@ pub enum OpenAIAdapterError {
     /// tool_calls 标记解析失败，携带 `{TOOL_CALL_START}...{TOOL_CALL_END}` 内的原始文本
     #[error("tool_calls repair needed: {0}")]
     ToolCallRepairNeeded(String),
+
+    /// 指定的账号（`X-DS-Account`）当前无法承接请求
+    #[error("account {id}: {reason}")]
+    Account {
+        id: String,
+        reason: ds_core::AccountUnavailable,
+    },
+}
+
+/// 指定账号不可用时的 HTTP 状态码（OpenAI / Anthropic 信封共用）
+///
+/// - 404：池中没有该账号（调用方应先同步账号）；
+/// - 429：账号忙、配额用尽或被禁言，等 `Retry-After` 后可重试；
+/// - 503：账号正在恢复或上游临时不可用；
+/// - 403：凭据错误、封禁、设备被拒等，需要人工处理。
+pub(crate) const fn account_unavailable_status(reason: &ds_core::AccountUnavailable) -> u16 {
+    use ds_core::{AccountUnavailable, FailureKind};
+    match reason {
+        AccountUnavailable::NotFound => 404,
+        AccountUnavailable::Busy | AccountUnavailable::QuotaExhausted { .. } => 429,
+        AccountUnavailable::Recovering => 503,
+        AccountUnavailable::Failed(failure) => match failure.kind {
+            FailureKind::Muted => 429,
+            FailureKind::Blocked | FailureKind::Unavailable => 503,
+            FailureKind::InvalidCredentials
+            | FailureKind::Banned
+            | FailureKind::DeviceRejected
+            | FailureKind::Rejected
+            | FailureKind::HealthCheck
+            | FailureKind::InvalidConfig => 403,
+        },
+    }
 }
 
 impl From<CoreError> for OpenAIAdapterError {
@@ -641,6 +612,7 @@ impl From<CoreError> for OpenAIAdapterError {
             }
             CoreError::ProviderError(msg) => Self::ProviderError(msg),
             CoreError::Stream(msg) => Self::Internal(msg),
+            CoreError::Account { id, reason } => Self::Account { id, reason },
         }
     }
 }
@@ -660,6 +632,17 @@ impl OpenAIAdapterError {
             Self::Overloaded => 429,
             Self::ProviderError(_) => 502,
             Self::Internal(_) | Self::ToolCallRepairNeeded(_) => 500,
+            Self::Account { reason, .. } => account_unavailable_status(reason),
+        }
+    }
+
+    /// `Retry-After` 秒数；None = 不带该头
+    #[must_use]
+    pub fn retry_after_secs(&self) -> Option<u64> {
+        match self {
+            Self::Overloaded => Some(30),
+            Self::Account { reason, .. } => reason.retry_after_secs(),
+            _ => None,
         }
     }
 }

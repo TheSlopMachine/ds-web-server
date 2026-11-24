@@ -2,7 +2,7 @@
 
 use axum::{
     body::Body,
-    extract::{Query, State},
+    extract::{Path, Query, State},
     http::{StatusCode, header},
     response::Response,
 };
@@ -421,6 +421,11 @@ pub(crate) async fn admin_put_config(
                 .jwt_secret
                 .clone_from(&current.admin.jwt_secret);
         }
+        // 管理 API 静态令牌只能在 config.toml 里设置，面板保存时原样保留
+        new_config
+            .admin
+            .api_token
+            .clone_from(&current.admin.api_token);
         // 密码修改：前端发 old_password + new_password
         if !new_config.admin.old_password.is_empty() || !new_config.admin.new_password.is_empty() {
             if new_config.admin.old_password.is_empty() || new_config.admin.new_password.is_empty()
@@ -453,11 +458,156 @@ pub(crate) async fn admin_put_config(
     }
 
     // Hot-reload: sync accounts from the new config
-    state
+    let _accounts = state.accounts_lock.lock().await;
+    if let Err(e) = state
         .adapter
-        .sync_accounts(&new_config.ds_core.accounts)
-        .await;
+        .sync_accounts(&new_config.ds_core.accounts, true)
+        .await
+    {
+        return pool_error_response(&e);
+    }
     json_response(&serde_json::json!({"ok": true}))
+}
+
+// ── 账号管理 API ──────────────────────────────────────────────────────────
+//
+// 供自动化调用方逐个管理账号：每次变更都会同步账号池并写回 config.toml，
+// 返回的状态里带登录失败原因（`failure`），调用方不需要再去翻运行日志。
+
+#[derive(Serialize)]
+pub struct AdminAccountsResponse {
+    pub accounts: Vec<ds_core::AccountStatus>,
+}
+
+#[derive(Deserialize)]
+pub struct ReplaceAccountsRequest {
+    pub accounts: Vec<crate::config::Account>,
+}
+
+/// GET /admin/api/accounts — 全部账号的状态
+pub(crate) async fn admin_accounts(State(state): State<AppState>) -> Response {
+    json_response(&AdminAccountsResponse {
+        accounts: state.adapter.account_statuses(),
+    })
+}
+
+/// PUT /admin/api/accounts — 整体替换账号列表
+///
+/// 新增或凭据变化的账号立即登录；凭据未变的账号保持原状（适合周期性同步）；
+/// 列表之外的账号被移除。返回列表中各账号的状态（按请求顺序）。
+pub(crate) async fn admin_replace_accounts(
+    State(state): State<AppState>,
+    body: axum::body::Bytes,
+) -> Response {
+    let req: ReplaceAccountsRequest = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(e) => return error_response(StatusCode::BAD_REQUEST, &format!("请求格式错误: {e}")),
+    };
+    if req.accounts.iter().any(|a| a.id().is_empty()) {
+        return error_response(StatusCode::BAD_REQUEST, "每个账号都需要 email 或 mobile");
+    }
+
+    let _accounts = state.accounts_lock.lock().await;
+    let statuses = match state.adapter.sync_accounts(&req.accounts, true).await {
+        Ok(s) => s,
+        Err(e) => return pool_error_response(&e),
+    };
+    if let Err(response) = persist_accounts(&state, |accounts| *accounts = req.accounts).await {
+        return response;
+    }
+    json_response(&AdminAccountsResponse { accounts: statuses })
+}
+
+/// PUT /admin/api/accounts/{id} — 新增或更新单个账号，返回登录后的状态
+///
+/// `id` 必须等于请求体的 email（或无 email 时的 mobile）。凭据未变时不会重新登录。
+pub(crate) async fn admin_put_account(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    body: axum::body::Bytes,
+) -> Response {
+    let account: crate::config::Account = match serde_json::from_slice(&body) {
+        Ok(a) => a,
+        Err(e) => return error_response(StatusCode::BAD_REQUEST, &format!("请求格式错误: {e}")),
+    };
+    if account.id() != id {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "路径中的账号与请求体的 email / mobile 不一致",
+        );
+    }
+
+    let _accounts = state.accounts_lock.lock().await;
+    let status = match state
+        .adapter
+        .sync_accounts(std::slice::from_ref(&account), false)
+        .await
+    {
+        Ok(mut s) => s.remove(0),
+        Err(e) => return pool_error_response(&e),
+    };
+    let persisted = persist_accounts(&state, |accounts| {
+        match accounts.iter_mut().find(|a| a.id() == id) {
+            Some(existing) => *existing = account,
+            None => accounts.push(account),
+        }
+    })
+    .await;
+    if let Err(response) = persisted {
+        return response;
+    }
+    json_response(&status)
+}
+
+/// DELETE /admin/api/accounts/{id} — 移除账号（进行中的请求会正常跑完）
+pub(crate) async fn admin_delete_account(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Response {
+    let _accounts = state.accounts_lock.lock().await;
+    if let Err(e) = state.adapter.remove_account(&id) {
+        return pool_error_response(&e);
+    }
+    if let Err(response) =
+        persist_accounts(&state, |accounts| accounts.retain(|a| a.id() != id)).await
+    {
+        return response;
+    }
+    json_response(&serde_json::json!({"ok": true}))
+}
+
+/// POST /admin/api/accounts/{id}/login — 立即重新登录（忙碌中的账号返回 409）
+pub(crate) async fn admin_login_account(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Response {
+    let _accounts = state.accounts_lock.lock().await;
+    match state.adapter.relogin(&id).await {
+        Ok(status) => json_response(&status),
+        Err(e) => pool_error_response(&e),
+    }
+}
+
+/// 修改配置里的账号列表并写回 config.toml
+async fn persist_accounts(
+    state: &AppState,
+    update: impl FnOnce(&mut Vec<crate::config::Account>),
+) -> Result<(), Response> {
+    let mut config = state.config.write().await;
+    update(&mut config.ds_core.accounts);
+    let saved = config.save(&state.config_path);
+    drop(config);
+    saved.map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &format!("保存失败: {e}")))
+}
+
+fn pool_error_response(e: &ds_core::PoolError) -> Response {
+    let status = match e {
+        ds_core::PoolError::NotFound(_) => StatusCode::NOT_FOUND,
+        ds_core::PoolError::AccountBusy(_) => StatusCode::CONFLICT,
+        ds_core::PoolError::NotReady => StatusCode::SERVICE_UNAVAILABLE,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    error_response(status, &e.to_string())
 }
 
 #[derive(Deserialize)]

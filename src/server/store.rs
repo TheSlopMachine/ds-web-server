@@ -159,6 +159,20 @@ impl StoreManager {
         Ok(result?)
     }
 
+    /// 是否为配置的管理 API 静态令牌（`[admin] api_token`，未配置时恒为 false）
+    pub async fn is_admin_api_token(&self, token: &str) -> bool {
+        let expected = self.config.read().await.admin.api_token.clone();
+        // 常量时间比较：避免按字节逐位猜测令牌
+        !expected.is_empty()
+            && expected.len() == token.len()
+            && expected
+                .as_bytes()
+                .iter()
+                .zip(token.as_bytes())
+                .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+                == 0
+    }
+
     /// 查找 API Key 是否有效
     pub async fn is_valid_api_key(&self, key: &str) -> bool {
         let guard = self.config.read().await;

@@ -50,7 +50,7 @@ pub struct DsCoreConfig {
 }
 
 /// 单个账号配置
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AccountConfig {
     pub email: String,
     pub mobile: String,

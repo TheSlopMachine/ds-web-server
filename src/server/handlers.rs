@@ -151,6 +151,17 @@ pub(crate) fn next_request_id() -> String {
 
 const X_DS_ACCOUNT: &str = "x-ds-account";
 
+/// 请求头 `X-DS-Account`：指定由哪个账号（email 或 mobile）处理本请求
+///
+/// 不带该头时由号池挑选；带上后只用该账号，账号不可用时返回对应错误码，不会换号。
+fn pinned_account(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(X_DS_ACCOUNT)
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+}
+
 /// Anthropic 规范建议每个响应携带本次请求 ID
 const ANTHROPIC_REQUEST_ID: &str = "request-id";
 
@@ -172,6 +183,8 @@ pub(crate) struct AppState {
     pub(crate) config_path: PathBuf,
     /// `Idempotency-Key` 缓存（进程内，有界 + TTL）
     pub(crate) idempotency: Arc<IdempotencyStore>,
+    /// 串行化账号增删改（登录要等网络，不能拿配置写锁去等）
+    pub(crate) accounts_lock: Arc<tokio::sync::Mutex<()>>,
 }
 struct RequestRecord<'a> {
     request_id: &'a str,
@@ -349,7 +362,10 @@ pub(crate) async fn chat_completions(
     log::debug!(target: "http::request", "req={} POST /v1/chat/completions stream={}", request_id, req.stream);
     let model = req.model.clone();
 
-    let result = state.adapter.chat_completions(req, &request_id).await;
+    let result = state
+        .adapter
+        .chat_completions(req, &request_id, pinned_account(&headers))
+        .await;
     match &result {
         Ok(_) => timer.mark_success(),
         Err(_) => timer.mark_failure(),
@@ -475,7 +491,10 @@ pub(crate) async fn responses(
     );
     let model = req.model.clone();
 
-    let result = state.responses_adapter.create(req, &request_id).await;
+    let result = state
+        .responses_adapter
+        .create(req, &request_id, pinned_account(&headers))
+        .await;
     match &result {
         Ok(_) => timer.mark_success(),
         Err(_) => timer.mark_failure(),
@@ -631,7 +650,10 @@ pub(crate) async fn anthropic_messages(
     log::debug!(target: "http::request", "req={} POST /anthropic/v1/messages stream={}", request_id, req.stream);
     let model = req.model.clone();
 
-    let result = state.anthropic_compat.messages(req, &request_id).await;
+    let result = state
+        .anthropic_compat
+        .messages(req, &request_id, pinned_account(&headers))
+        .await;
     match &result {
         Ok(_) => timer.mark_success(),
         Err(_) => timer.mark_failure(),

@@ -6,8 +6,7 @@ mod accounts;
 mod chat;
 mod config;
 
-pub use accounts::PoolError;
-pub use accounts::pool::AccountStatus;
+pub use accounts::{AccountFailure, AccountStatus, AccountUnavailable, FailureKind, PoolError};
 pub use accounts::{
     ChatSessionInfo, ClientIdentity, DsClient, EmulationProfile, FetchSessionsData, HifConfig,
     LoginPayload,
@@ -37,6 +36,13 @@ pub enum CoreError {
     /// 流处理错误：连接中断等
     #[error("stream error: {0}")]
     Stream(String),
+
+    /// 请求指定的账号（`ChatRequest::account`）当前无法承接请求
+    #[error("account {id}: {reason}")]
+    Account {
+        id: String,
+        reason: AccountUnavailable,
+    },
 }
 
 impl From<accounts::ClientError> for CoreError {
@@ -91,24 +97,24 @@ impl DsCore {
         self.accounts.fetch_sessions(updated_at).await
     }
 
-    /// 动态添加账号
-    pub async fn add_account(&self, creds: &AccountConfig) -> Result<String, PoolError> {
-        self.accounts.add_account(creds).await
+    /// 让账号池与期望列表一致：新增 / 凭据变化的账号登录，未变的保持原状，
+    /// `remove_missing` 时移除列表之外的账号。返回期望列表中各账号的状态。
+    pub async fn sync_accounts(
+        &self,
+        desired: Vec<AccountConfig>,
+        remove_missing: bool,
+    ) -> Result<Vec<AccountStatus>, PoolError> {
+        self.accounts.sync_accounts(desired, remove_missing).await
     }
 
-    /// 动态移除账号
-    pub fn remove_account(&self, email_or_mobile: &str) -> Result<String, PoolError> {
-        self.accounts.remove_account(email_or_mobile)
+    /// 移除账号（正在进行的请求会正常跑完）
+    pub fn remove_account(&self, id: &str) -> Result<String, PoolError> {
+        self.accounts.remove_account(id)
     }
 
-    /// 标记账号为 Error 状态
-    pub fn mark_error(&self, email_or_mobile: &str) {
-        self.accounts.mark_error(email_or_mobile);
-    }
-
-    /// 手动重新登录指定账号
-    pub async fn re_login_single(&self, email_or_mobile: &str) -> Result<(), String> {
-        self.accounts.re_login_single(email_or_mobile).await
+    /// 重新登录指定账号
+    pub async fn relogin(&self, id: &str) -> Result<AccountStatus, PoolError> {
+        self.accounts.relogin(id).await
     }
 
     /// 优雅关闭：清理所有残留 session（活动中的 + 复用缓存的）

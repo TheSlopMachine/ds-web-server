@@ -75,6 +75,7 @@ impl ResponsesAdapter {
         &self,
         req: ResponsesRequest,
         request_id: &str,
+        account: Option<&str>,
     ) -> Result<ChatResult<ResponsesOutput>, OpenAIAdapterError> {
         debug!(
             target: "responses_adapter",
@@ -106,7 +107,7 @@ impl ResponsesAdapter {
         // 3) 委托 OpenAI 适配器
         let result = self
             .openai_adapter
-            .chat_completions(chat_req, request_id)
+            .chat_completions(chat_req, request_id, account)
             .await?;
 
         let account_id = result.account_id;

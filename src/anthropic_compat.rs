@@ -51,12 +51,13 @@ impl AnthropicCompat {
         &self,
         req: MessagesRequest,
         request_id: &str,
+        account: Option<&str>,
     ) -> Result<ChatResult<AnthropicOutput>, AnthropicCompatError> {
         debug!(target: "anthropic_compat", "received messages request");
         let chat_req = request::into_chat_completions(req);
         let result = self
             .openai_adapter
-            .chat_completions(chat_req, request_id)
+            .chat_completions(chat_req, request_id, account)
             .await?;
         let data = match result.data {
             ChatOutput::Stream(stream) => {
@@ -100,6 +101,12 @@ pub enum AnthropicCompatError {
     Overloaded,
     #[error("internal error: {0}")]
     Internal(String),
+    /// 指定的账号（`X-DS-Account`）当前无法承接请求
+    #[error("account {id}: {reason}")]
+    Account {
+        id: String,
+        reason: ds_core::AccountUnavailable,
+    },
 }
 
 impl From<OpenAIAdapterError> for AnthropicCompatError {
@@ -110,6 +117,7 @@ impl From<OpenAIAdapterError> for AnthropicCompatError {
             OpenAIAdapterError::ProviderError(msg)
             | OpenAIAdapterError::Internal(msg)
             | OpenAIAdapterError::ToolCallRepairNeeded(msg) => Self::Internal(msg),
+            OpenAIAdapterError::Account { id, reason } => Self::Account { id, reason },
         }
     }
 }
@@ -122,6 +130,19 @@ impl AnthropicCompatError {
             Self::BadRequest(_) => 400,
             Self::Overloaded => 429,
             Self::Internal(_) => 500,
+            Self::Account { reason, .. } => {
+                crate::openai_adapter::account_unavailable_status(reason)
+            }
+        }
+    }
+
+    /// `Retry-After` 秒数；None = 不带该头
+    #[must_use]
+    pub fn retry_after_secs(&self) -> Option<u64> {
+        match self {
+            Self::Overloaded => Some(30),
+            Self::Account { reason, .. } => reason.retry_after_secs(),
+            Self::BadRequest(_) | Self::Internal(_) => None,
         }
     }
 }

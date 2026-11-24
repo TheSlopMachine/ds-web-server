@@ -43,7 +43,7 @@ async fn main() -> anyhow::Result<()> {
         startup_health_check: config.ds_core.startup_health_check,
         session_policy: config.ds_core.session_policy.clone(),
         session_idle_secs: config.ds_core.session_idle_secs,
-        proxy_url: config.proxy.url.clone(),
+        proxy_url: config.proxy.effective_url(),
         model_types: config.ds_core.model_types.clone(),
         input_character_limits: config.ds_core.input_character_limits.clone(),
         // 探测工具会连续发请求做 A/B 对比，配额交给调用方自行控制
@@ -85,6 +85,7 @@ async fn main() -> anyhow::Result<()> {
             model_type: model_type.clone(),
             files: vec![],
             delta: None,
+            account: None,
         };
 
         let start = Instant::now();

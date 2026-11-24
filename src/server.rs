@@ -84,6 +84,7 @@ pub async fn run(config: Config, config_path: PathBuf) -> anyhow::Result<()> {
         store: store.clone(),
         login_limiter: login_limiter.clone(),
         idempotency: Arc::new(idempotency::IdempotencyStore::new()),
+        accounts_lock: Arc::new(tokio::sync::Mutex::new(())),
     };
     let router = build_router(state.clone(), &cors_origins);
 
@@ -164,6 +165,19 @@ fn build_router(state: AppState, cors_origins: &[String]) -> Router {
         .route("/admin/api/logs", get(admin::admin_logs))
         // Runtime logs
         .route("/admin/api/runtime-logs", get(admin::admin_runtime_logs))
+        // Accounts
+        .route(
+            "/admin/api/accounts",
+            get(admin::admin_accounts).put(admin::admin_replace_accounts),
+        )
+        .route(
+            "/admin/api/accounts/{id}",
+            put(admin::admin_put_account).delete(admin::admin_delete_account),
+        )
+        .route(
+            "/admin/api/accounts/{id}/login",
+            post(admin::admin_login_account),
+        )
         .layer(middleware::from_fn(move |req, next| {
             let store = admin_store.clone();
             async move { jwt_middleware(req, next, store).await }
@@ -363,11 +377,11 @@ async fn api_key_middleware(
     next.run(req).await
 }
 
-/// JWT 鉴权中间件（管理面板路由）
+/// 管理路由鉴权中间件：接受管理面板的 JWT 或配置的静态 `api_token`
 async fn jwt_middleware(req: Request, next: Next, store: Arc<store::StoreManager>) -> Response {
     let token = extract_bearer_token(&req);
     let valid = match token {
-        Some(t) => auth::verify_jwt(&store, t).await,
+        Some(t) => store.is_admin_api_token(t).await || auth::verify_jwt(&store, t).await,
         None => false,
     };
 

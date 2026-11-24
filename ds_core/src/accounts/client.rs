@@ -260,17 +260,16 @@ pub struct CompletionPayload {
     pub search_enabled: bool,
     /// 真实客户端固定发送该字段（会话首条为 null）
     pub action: Option<serde_json::Value>,
-    /// 消息来源（官方前端的输入方式：`input` / `click` / `keyboard` / `paste` …）
+    /// 消息来源：真实客户端的 completion payload 一定带 `source`
     ///
-    /// 2026-10-07 从前端 bundle 提取：真实客户端的 completion payload 一定带
-    /// `source`，取值是**用户如何发出这条消息**。代理侧按「键盘输入 + 发送」的
-    /// 主路径填 `input`（真实用户最常态的方式）。
+    /// 2026-11-24 实测上游只接受 `default` / `landing`（发 `input` 返回 422
+    /// `unknown variant`）；`landing` 对应落地页发起的首条消息，代理统一填 `default`。
     pub source: &'static str,
     pub preempt: bool,
 }
 
-/// 代理侧统一使用的 `source` 取值（对齐真实客户端的主路径：输入框输入）
-pub const COMPLETION_SOURCE_INPUT: &str = "input";
+/// 代理侧统一使用的 `source` 取值
+pub const COMPLETION_SOURCE: &str = "default";
 
 #[derive(Debug, Serialize)]
 #[allow(dead_code)]
@@ -305,10 +304,16 @@ fn is_waf_challenge(resp: &wreq::Response) -> bool {
 fn print_waf_hint() {
     warn!(target: "ds_core::client", "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     warn!(target: "ds_core::client", "  AWS WAF Challenge detected.");
-    warn!(target: "ds_core::client", "  DeepSeek CloudFront WAF blocks US-based IPs.");
     warn!(target: "ds_core::client", "  Rust HTTP clients can't execute the JS challenge.");
+    warn!(target: "ds_core::client", "  From some regions (US, and EU as of 2026-11) the login endpoint");
+    warn!(target: "ds_core::client", "  challenges the web identity while the app identity passes.");
     warn!(target: "ds_core::client", "");
-    warn!(target: "ds_core::client", "  To fix this, configure a non-US proxy in config.toml:");
+    warn!(target: "ds_core::client", "  Fix 1: switch [ds_core] to the app identity:");
+    warn!(target: "ds_core::client", "    emulation = \"okhttp4_12\"");
+    warn!(target: "ds_core::client", "    user_agent = \"DeepSeek/2.5.0 Android/35\"");
+    warn!(target: "ds_core::client", "    client_platform = \"android\"");
+    warn!(target: "ds_core::client", "    client_os = \"android\"");
+    warn!(target: "ds_core::client", "  Fix 2: use a proxy in another region:");
     warn!(target: "ds_core::client", "    [proxy]");
     warn!(target: "ds_core::client", "    url = \"http://127.0.0.1:7890\"");
     warn!(target: "ds_core::client", "");
@@ -647,7 +652,7 @@ impl DsClient {
             print_waf_hint();
             return Err(ClientError::Status {
                 status: 202,
-                body: "WAF Challenge: use a non-US proxy".into(),
+                body: "WAF challenge: switch to the app identity (emulation = okhttp4_12) or a proxy in another region".into(),
             });
         }
 

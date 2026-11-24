@@ -37,7 +37,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ..HifConfig::default()
         },
         ds_core::EmulationProfile::from_config(&config.ds_core.emulation).unwrap_or_default(),
-        config.proxy.url.as_deref(),
+        config.proxy.effective_url().as_deref(),
     );
 
     for account in &config.ds_core.accounts {

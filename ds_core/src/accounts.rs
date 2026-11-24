@@ -14,15 +14,24 @@ use tokio::sync::RwLock;
 use crate::CoreError;
 use crate::config::{AccountConfig, DsCoreConfig};
 pub use client::{
-    COMPLETION_SOURCE_INPUT, ChatSessionInfo, ClientError, ClientIdentity, CompletionPayload,
-    DsClient, EmulationProfile, FetchSessionsData, HifConfig, LoginPayload, StopStreamPayload,
+    COMPLETION_SOURCE, ChatSessionInfo, ClientError, ClientIdentity, CompletionPayload, DsClient,
+    EmulationProfile, FetchSessionsData, HifConfig, LoginPayload, StopStreamPayload,
 };
-pub use pool::{Account, AccountGuard, AccountPool, AccountStatus, PoolError};
+pub use pool::{
+    Account, AccountFailure, AccountGuard, AccountPool, AccountStatus, AccountUnavailable,
+    FailureKind, PoolError,
+};
 pub use pow::{PowError, PowSolver};
 
 /// 由配置构造 HTTP 客户端（客户端拟态身份 + HIF 风控令牌端点）
-fn build_client(config: &DsCoreConfig) -> DsClient {
-    DsClient::new(
+///
+/// 代理地址无法解析时直接报错：静默退回直连会暴露真实出口 IP，也会撞上 WAF。
+fn build_client(config: &DsCoreConfig) -> Result<DsClient, CoreError> {
+    if let Some(url) = config.proxy_url.as_deref() {
+        wreq::Proxy::all(url)
+            .map_err(|e| CoreError::ProviderError(format!("代理地址无效: {e}")))?;
+    }
+    Ok(DsClient::new(
         config.api_base.clone(),
         config.wasm_url.clone(),
         ClientIdentity {
@@ -49,7 +58,7 @@ fn build_client(config: &DsCoreConfig) -> DsClient {
             EmulationProfile::default()
         }),
         config.proxy_url.as_deref(),
-    )
+    ))
 }
 
 /// 账号模块的统一入口
@@ -69,7 +78,7 @@ impl Accounts {
         config: &DsCoreConfig,
         account_creds: Vec<AccountConfig>,
     ) -> Result<Arc<Self>, CoreError> {
-        let client = build_client(config);
+        let client = build_client(config)?;
 
         let wasm_bytes = client.get_wasm().await?;
         let solver = PowSolver::new(&wasm_bytes)?;
@@ -87,20 +96,13 @@ impl Accounts {
         };
         let pool = AccountPool::new(config.hourly_request_quota, config.startup_health_check)
             .with_session_reuse(session_reuse, config.session_idle_secs);
-        pool.init(account_creds, &client, &solver)
+        pool.set_client_solver(client.clone(), solver.clone()).await;
+        // 登录失败的账号留在池中（带失败原因），不阻断启动
+        pool.sync(account_creds, true)
             .await
-            .map_err(|e| match e {
-                PoolError::AllAccountsFailed => {
-                    CoreError::ProviderError("所有账号初始化失败".to_string())
-                }
-                PoolError::Client(e) => CoreError::ProviderError(e.to_string()),
-                PoolError::Pow(e) => CoreError::ProofOfWorkFailed(e),
-                PoolError::Validation(msg) => CoreError::ProviderError(format!("配置错误: {msg}")),
-                other => CoreError::ProviderError(other.to_string()),
-            })?;
+            .map_err(|e| CoreError::ProviderError(e.to_string()))?;
 
         let pool = Arc::new(pool);
-        pool.set_client_solver(client.clone(), solver.clone()).await;
         pool.start_recovery_task();
 
         Ok(Arc::new(Self {
@@ -264,22 +266,33 @@ impl Accounts {
         self.pool.reap_sessions(None).await
     }
 
-    pub async fn add_account(&self, creds: &AccountConfig) -> Result<String, PoolError> {
-        let client = self.client.read().await;
-        let solver = self.solver.read().await;
-        self.pool.add_account(creds, &client, &solver).await
+    pub async fn sync_accounts(
+        &self,
+        desired: Vec<AccountConfig>,
+        remove_missing: bool,
+    ) -> Result<Vec<AccountStatus>, PoolError> {
+        self.pool.sync(desired, remove_missing).await
     }
 
-    pub fn remove_account(&self, email_or_mobile: &str) -> Result<String, PoolError> {
-        self.pool.remove_account(email_or_mobile)
+    pub fn remove_account(&self, id: &str) -> Result<String, PoolError> {
+        self.pool.remove_account(id)
     }
 
-    pub async fn re_login_single(&self, email_or_mobile: &str) -> Result<(), String> {
-        self.pool.re_login_single(email_or_mobile).await
+    pub async fn relogin(&self, id: &str) -> Result<AccountStatus, PoolError> {
+        self.pool.relogin(id).await
+    }
+
+    /// 取指定账号（`ChatRequest::account`），忙碌时最多等待 `wait`
+    pub async fn acquire(
+        &self,
+        id: &str,
+        wait: std::time::Duration,
+    ) -> Result<AccountGuard, AccountUnavailable> {
+        self.pool.acquire(id, wait).await
     }
 
     pub async fn reload_config(&self, config: &DsCoreConfig) -> Result<(), CoreError> {
-        let client = build_client(config);
+        let client = build_client(config)?;
         let wasm_bytes = client.get_wasm().await?;
         let solver = PowSolver::new(&wasm_bytes)?;
 

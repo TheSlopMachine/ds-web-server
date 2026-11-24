@@ -11,7 +11,7 @@ use bytes::Bytes;
 use futures::{Stream, StreamExt};
 
 use crate::CoreError;
-use crate::accounts::CompletionPayload;
+use crate::accounts::{AccountGuard, CompletionPayload};
 
 use super::response::{
     ActiveSession, ResponseStream, SessionHandle, StreamEvent, check_hint, parse_json_error,
@@ -22,6 +22,9 @@ use super::response::{
 
 /// 超限路径的最大尝试次数（含首次）：失败后重试不会改变结果，仅覆盖瞬时错误
 const MAX_ATTEMPTS: usize = 3;
+
+/// 等待空闲账号的上限（号池选择与指定账号共用）
+const ACCOUNT_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 
 const TAG_START: &str = "<｜";
 const TAG_END: &str = "｜>";
@@ -150,6 +153,11 @@ pub struct ChatRequest {
     /// 提供该字段后，本代理在命中同一会话时可照此增量发送，避免把整段历史
     /// （连同 `<｜Role｜>` 标签）反复塞进 prompt。
     pub delta: Option<DeltaPrompt>,
+    /// 指定由哪个账号（email 或 mobile）处理；None = 由号池挑选空闲最久的账号
+    ///
+    /// 指定账号时不会换号重试：账号不可用直接返回 `CoreError::Account`，
+    /// 调用方（例如按账号管理凭据的上层路由）据此处理该账号。
+    pub account: Option<String>,
 }
 
 /// 增量 prompt：会话复用时只发新增内容
@@ -171,6 +179,48 @@ pub struct ChatResponse {
 use super::Chat;
 
 impl Chat {
+    /// 取处理本请求的账号
+    ///
+    /// 指定了 `req.account` 时只用该账号（忙碌时等待，其它不可用状态立即报错）；
+    /// 否则由号池挑选空闲最久的账号，首轮最多等待 `ACCOUNT_WAIT`，重试轮不等待。
+    async fn acquire_account(
+        &self,
+        req: &ChatRequest,
+        request_id: &str,
+        wait: bool,
+    ) -> Result<AccountGuard, CoreError> {
+        if let Some(id) = req.account.as_deref() {
+            return self
+                .accounts
+                .acquire(id, ACCOUNT_WAIT)
+                .await
+                .map_err(|reason| {
+                    log::warn!(
+                        target: "ds_core::accounts",
+                        "req={request_id} pinned account unavailable: account={id}, reason={reason}"
+                    );
+                    CoreError::Account {
+                        id: id.to_string(),
+                        reason,
+                    }
+                });
+        }
+        let guard = if wait {
+            self.accounts
+                .get_account_with_wait(u64::try_from(ACCOUNT_WAIT.as_millis()).unwrap_or(u64::MAX))
+                .await
+        } else {
+            self.accounts.get_account()
+        };
+        guard.ok_or_else(|| {
+            log::warn!(
+                target: "ds_core::accounts",
+                "req={request_id} 账号池无可用账号"
+            );
+            CoreError::Overloaded
+        })
+    }
+
     /// 对话入口：判断 prompt 大小，选择正常路径或回退方案
     pub async fn v0_chat(
         &self,
@@ -205,6 +255,7 @@ impl Chat {
                 .await
             {
                 Ok(resp) => return Ok(resp),
+                Err(e @ CoreError::Account { .. }) => return Err(e),
                 Err(CoreError::Overloaded) => {
                     if attempt + 1 >= MAX_ATTEMPTS {
                         return Err(CoreError::Overloaded);
@@ -249,6 +300,7 @@ impl Chat {
                 .await
             {
                 Ok(resp) => return Ok(resp),
+                Err(e @ CoreError::Account { .. }) => return Err(e),
                 Err(CoreError::Overloaded) => {
                     if attempt + 1 >= MAX_ATTEMPTS {
                         return Err(CoreError::Overloaded);
@@ -278,17 +330,7 @@ impl Chat {
         request_id: &str,
     ) -> Result<ChatResponse, CoreError> {
         // 1. 获取账号
-        let guard = self
-            .accounts
-            .get_account_with_wait(30_000)
-            .await
-            .ok_or_else(|| {
-                log::warn!(
-                    target: "ds_core::accounts",
-                    "req={request_id} 账号池无可用账号"
-                );
-                CoreError::Overloaded
-            })?;
+        let guard = self.acquire_account(req, request_id, true).await?;
         let account = guard.account_arc();
         let account_id = account.display_id().to_string();
         let token = account.token().to_string();
@@ -348,7 +390,7 @@ impl Chat {
                 thinking_enabled: false,
                 search_enabled: false,
                 action: None,
-                source: crate::accounts::COMPLETION_SOURCE_INPUT,
+                source: crate::accounts::COMPLETION_SOURCE,
                 preempt: false,
             };
 
@@ -421,7 +463,7 @@ impl Chat {
             thinking_enabled: req.thinking_enabled,
             search_enabled: req.search_enabled,
             action: None,
-            source: crate::accounts::COMPLETION_SOURCE_INPUT,
+            source: crate::accounts::COMPLETION_SOURCE,
             preempt: false,
         };
 
@@ -584,20 +626,8 @@ impl Chat {
         request_id: &str,
         first_try: bool,
     ) -> Result<ChatResponse, CoreError> {
-        // 1. 获取空闲账号
-        let guard = if first_try {
-            self.accounts.get_account_with_wait(30_000).await
-        } else {
-            self.accounts.get_account()
-        }
-        .ok_or_else(|| {
-            log::warn!(
-                target: "ds_core::accounts",
-                "req={request_id} 账号池无可用账号"
-            );
-            CoreError::Overloaded
-        })?;
-
+        // 1. 获取账号
+        let guard = self.acquire_account(req, request_id, first_try).await?;
         let account = guard.account_arc();
         let account_id = account.display_id().to_string();
         let token = account.token().to_string();
@@ -725,7 +755,7 @@ impl Chat {
             thinking_enabled: req.thinking_enabled,
             search_enabled: req.search_enabled,
             action: None,
-            source: crate::accounts::COMPLETION_SOURCE_INPUT,
+            source: crate::accounts::COMPLETION_SOURCE,
             preempt: false,
         };
 

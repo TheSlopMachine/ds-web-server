@@ -173,6 +173,12 @@ pub struct AdminConfig {
     /// 最近一次 JWT 签发时间（用于吊销旧 token）
     #[serde(default)]
     pub jwt_issued_at: u64,
+    /// 管理 API 的静态令牌（`Authorization: Bearer <api_token>`），空 = 只接受 JWT
+    ///
+    /// 给自动化调用方（例如托管本服务的上层系统）用：不需要先设置密码、登录，
+    /// 也不会因为别处登录轮换 JWT 而失效。请使用足够长的随机值。
+    #[serde(default)]
+    pub api_token: String,
     /// 修改密码：旧密码明文（仅 PUT 接收，不落地 config.toml）
     #[serde(default, skip_serializing)]
     pub old_password: String,
@@ -192,10 +198,13 @@ pub struct ApiKeyEntry {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Account {
     /// 邮箱（与 mobile 二选一）
+    #[serde(default)]
     pub email: String,
     /// 手机号（与 email 二选一）
+    #[serde(default)]
     pub mobile: String,
     /// 区号（与 mobile 配合使用，如 "+86"）
+    #[serde(default)]
     pub area_code: String,
     /// 密码
     pub password: String,
@@ -204,11 +213,61 @@ pub struct Account {
     pub device_id: String,
 }
 
+impl Account {
+    /// 账号标识：email 优先，回退 mobile（与账号池、管理 API、`X-DS-Account` 一致）
+    #[must_use]
+    pub fn id(&self) -> &str {
+        if self.email.is_empty() {
+            &self.mobile
+        } else {
+            &self.email
+        }
+    }
+
+    /// 转成 ds_core 的账号配置
+    #[must_use]
+    pub fn to_core(&self) -> ds_core::AccountConfig {
+        ds_core::AccountConfig {
+            email: self.email.clone(),
+            mobile: self.mobile.clone(),
+            area_code: self.area_code.clone(),
+            password: self.password.clone(),
+            device_id: self.device_id.clone(),
+        }
+    }
+}
+
 /// 代理配置
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct ProxyConfig {
     /// 代理 URL，如 http://127.0.0.1:7890 或 socks5://127.0.0.1:7891
+    ///
+    /// 未设置时依次读取环境变量 `HTTPS_PROXY` / `https_proxy` / `ALL_PROXY` / `all_proxy`
+    /// （容器里通常由编排方注入出口代理）。
     pub url: Option<String>,
+}
+
+/// 未配置 `[proxy] url` 时按顺序读取的环境变量
+const PROXY_ENV_VARS: [&str; 4] = ["HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"];
+
+impl ProxyConfig {
+    /// 实际使用的代理：配置优先，其次环境变量；都没有则直连
+    #[must_use]
+    pub fn effective_url(&self) -> Option<String> {
+        let configured = self
+            .url
+            .as_deref()
+            .map(str::trim)
+            .filter(|u| !u.is_empty())
+            .map(str::to_owned);
+        configured.or_else(|| {
+            PROXY_ENV_VARS
+                .iter()
+                .filter_map(|name| std::env::var(name).ok())
+                .map(|u| u.trim().to_owned())
+                .find(|u| !u.is_empty())
+        })
+    }
 }
 
 /// 工具调用标签配置
@@ -410,14 +469,9 @@ impl Config {
     /// 按 email（优先）或 mobile 去重，保留首次出现的账号
     fn dedup_accounts(&mut self) {
         let mut seen = std::collections::HashSet::new();
-        self.ds_core.accounts.retain(|a| {
-            let key = if a.email.is_empty() {
-                a.mobile.clone()
-            } else {
-                a.email.clone()
-            };
-            seen.insert(key)
-        });
+        self.ds_core
+            .accounts
+            .retain(|a| seen.insert(a.id().to_string()));
     }
 
     /// 解析命令行参数并加载配置
