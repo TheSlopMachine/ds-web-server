@@ -225,6 +225,11 @@ jobs:
           wget https://github.com/musl-cc/musl.cc/releases/latest/download/${{ matrix.package }}.tgz
           tar xzf ${{ matrix.package }}.tgz -C /opt
           echo "/opt/${{ matrix.package }}/bin/" >> "$GITHUB_PATH"
+          # boring-sys2 runs bindgen with the host clang, which otherwise mixes in host glibc
+          # headers (`/usr/include`, or the crossbuild-essential GCC install for aarch64) and
+          # fails on `bits/libc-header-start.h` / `__time64_t`. Point it at the musl toolchain.
+          pkg="${{ matrix.package }}"
+          echo "BINDGEN_EXTRA_CLANG_ARGS=--sysroot=/opt/${pkg}/${pkg%-cross} --gcc-toolchain=/opt/${pkg}" >> "$GITHUB_ENV"
       - name: Build
         env: ${{ matrix.custom_env }}
         run: cargo build --release --locked --target ${{ matrix.target }}
