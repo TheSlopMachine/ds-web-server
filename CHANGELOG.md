@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-11-24
+
 ### 修复：开启思考时回答为空（upstream issue #125）
 
 - 2026-11 起上游在回答开始时用 `o: "SET"` 整表替换 `response/fragments`（旧协议是
